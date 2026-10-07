@@ -1,0 +1,10 @@
+{
+  "additionalFiles": "",
+  "builtInToolsFolders": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "build.warn_data_percentage=75",
+  "fqbn": "esp32:esp32:esp32s3",
+  "hardwareFolders": "D:\\ArduinoTools\\arduino-data\\packages",
+  "otherLibrariesFolders": "D:\\ArduinoTools\\ArduinoSketchbook\\libraries",
+  "sketchLocation": "D:\\20269proj\\esp32_s3_wifi_serial"
+}

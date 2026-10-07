@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>环境数据监控</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">ESP32-S3 / WIFI TELEMETRY</p>
+      <h1>环境数据监控</h1>
+    </div>
+    <div class="connection" id="connectionStatus"><span class="dot"></span>后端连接中</div>
+  </header>
+
+  <main class="layout">
+    <section class="overview" aria-label="概览">
+      <div class="overview-item"><span>在线设备</span><strong id="deviceCount">0</strong></div>
+      <div class="overview-item"><span>传感模块</span><strong id="moduleCount">0</strong></div>
+      <div class="overview-item"><span>最后更新</span><strong id="lastUpdate">--</strong></div>
+    </section>
+
+    <section class="section-heading">
+      <div><p class="eyebrow">LIVE MODULES</p><h2>模块数据</h2></div>
+      <button class="icon-button" id="refreshButton" title="立即刷新" aria-label="立即刷新">↻</button>
+    </section>
+    <section class="module-grid" id="moduleGrid" aria-live="polite">
+      <div class="empty-state">等待传感器数据…</div>
+    </section>
+
+    <section class="lower-grid">
+      <section class="panel command-panel">
+        <div class="panel-heading"><div><p class="eyebrow">UART COMMAND</p><h2>发送串口命令</h2></div></div>
+        <form id="commandForm">
+          <label for="commandInput">命令内容</label>
+          <div class="command-row"><input id="commandInput" autocomplete="off" placeholder="例如：read_status" required><button type="submit">发送</button></div>
+          <p class="form-result" id="commandResult">命令会发送到当前在线的 ESP32。</p>
+        </form>
+      </section>
+      <section class="panel log-panel">
+        <div class="panel-heading"><div><p class="eyebrow">SERIAL LOG</p><h2>最近消息</h2></div></div>
+        <div class="log-list" id="logList"><div class="empty-state">暂无消息</div></div>
+      </section>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
