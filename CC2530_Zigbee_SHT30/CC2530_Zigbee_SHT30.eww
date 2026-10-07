@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+
+<workspace>
+  <project>
+    <path>$WS_DIR$\CC2530_Zigbee_SHT30.ewp</path>
+  </project>
+  <batchBuild>
+    <batchDefinition>
+      <name>ALL</name>
+      <member>
+        <project>CC2530_Zigbee_SHT30</project>
+        <configuration>CoordinatorEB</configuration>
+      </member>
+      <member>
+        <project>CC2530_Zigbee_SHT30</project>
+        <configuration>RouterEB</configuration>
+      </member>
+      <member>
+        <project>CC2530_Zigbee_SHT30</project>
+        <configuration>EndDeviceEB</configuration>
+      </member>
+      <member>
+        <project>CC2530_Zigbee_SHT30</project>
+        <configuration>RouterZLight</configuration>
+      </member>
+    </batchDefinition>
+  </batchBuild>
+</workspace>
+
+
+
