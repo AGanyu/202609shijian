@@ -1,15 +1,19 @@
-// ESP32-S3 WiFi/TCP <-> UART bridge.
-// Wire the external serial device to SERIAL_RX_PIN/SERIAL_TX_PIN and
-// configure the WiFi and PC address below before uploading.
+// ESP32-S3 WiFi gateway.
+// SensorSerial reads the local sensor; DeviceSerial receives JSON frames from
+// a local sensor node and forwards both sources to the public backend.
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 // ---------------- User configuration ----------------
-const char *WIFI_SSID = "7538";
-const char *WIFI_PASSWORD = "775751422";
+const char *WIFI_SSID = "Redmi K60_5pPpkEG_MI";
+const char *WIFI_PASSWORD = "Mf6Yf3B7ZE";
 const char *DEVICE_ID = "ESP32-S3-R-01";
 const char *BACKEND_HOST = "192.168.76.241"; // legacy TCP fallback
 constexpr uint16_t BACKEND_PORT = 8765;
@@ -20,14 +24,19 @@ constexpr bool USE_HTTP_POST = true;
 constexpr bool USE_HTTPS_INSECURE_FOR_TEST = true;
 
 constexpr uint32_t DEVICE_SERIAL_BAUD = 115200;
-constexpr int SERIAL_RX_PIN = 17;
-constexpr int SERIAL_TX_PIN = 18;
+constexpr int NODE_RX_PIN = 15;
+constexpr int NODE_TX_PIN = 16;
 // Sensor output device: 9600 baud, 8 data bits, 1 stop bit, no parity.
 constexpr uint32_t SENSOR_SERIAL_BAUD = 9600;
 constexpr int SENSOR_RX_PIN = 4;
 constexpr int SENSOR_TX_PIN = 5;
 constexpr bool DEBUG_SENSOR_TEST = false;
+constexpr bool DEBUG_NODE_DIAGNOSTICS = false;
+constexpr bool DEBUG_USB_MIRROR = true;
 constexpr uint32_t DEBUG_SENSOR_INTERVAL_MS = 5000;
+// Drain the sensor UART continuously, but accept at most one valid frame per
+// interval. This prevents a talkative sensor from filling the batch buffer.
+constexpr uint32_t SENSOR_SAMPLE_INTERVAL_MS = 5000;
 constexpr size_t MAX_LINE_LENGTH = 768;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 5000;
 constexpr uint32_t TCP_RETRY_INTERVAL_MS = 3000;
@@ -41,7 +50,23 @@ String networkLine;
 uint32_t nextWiFiRetry = 0;
 uint32_t nextTcpRetry = 0;
 uint32_t nextDebugSensor = 0;
+uint32_t nextSensorRead = 0;
 uint32_t nextHttpCommandPoll = 0;
+
+constexpr uint16_t BATCH_INTERVAL_MS = 5000;
+constexpr uint16_t BATCH_MAX_MESSAGES = 64;
+
+struct BatchBuffer {
+  uint16_t count;
+  char messages[BATCH_MAX_MESSAGES][MAX_LINE_LENGTH];
+};
+
+BatchBuffer batchA{};
+BatchBuffer batchB{};
+BatchBuffer *activeBatch = &batchA;
+BatchBuffer *sendingBatch = &batchB;
+SemaphoreHandle_t batchMutex = nullptr;
+void pollHttpCommands();
 
 void sendJson(JsonDocument &document) {
   if (!tcpClient.connected()) {
@@ -71,34 +96,111 @@ void sendSerialLine(const String &line) {
   sendJson(document);
 }
 
-void sendSensorReading(const char *module, float humidity, float temperature, const char *raw) {
-  JsonDocument document;
-  document["type"] = "serial";
-  document["device_id"] = DEVICE_ID;
-  JsonObject data = document["data"].to<JsonObject>();
-  data["module"] = module;
-  data["temperature"] = temperature;
-  data["humidity"] = humidity;
-  data["raw"] = raw;
-  document["millis"] = millis();
-  if (USE_HTTP_POST && WiFi.status() == WL_CONNECTED) {
-    String payload;
-    serializeJson(document, payload);
-    WiFiClientSecure secureClient;
-    if (USE_HTTPS_INSECURE_FOR_TEST) {
-      secureClient.setInsecure();
-    }
-    HTTPClient http;
-    http.setConnectTimeout(1500);
-    http.setTimeout(1500);
-    http.begin(secureClient, HTTP_TELEMETRY_URL);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Device-Token", API_TOKEN);
-    const int statusCode = http.POST(payload);
-    Serial.printf("HTTP telemetry POST: %d\n", statusCode);
-    http.end();
-  } else {
+bool postTelemetry(JsonDocument &document) {
+  if (!USE_HTTP_POST || WiFi.status() != WL_CONNECTED) {
     sendJson(document);
+    return false;
+  }
+
+  String payload;
+  serializeJson(document, payload);
+  WiFiClientSecure secureClient;
+  if (USE_HTTPS_INSECURE_FOR_TEST) {
+    secureClient.setInsecure();
+  }
+  HTTPClient http;
+  http.setConnectTimeout(1500);
+  http.setTimeout(1500);
+  if (!http.begin(secureClient, HTTP_TELEMETRY_URL)) {
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Token", API_TOKEN);
+  const int statusCode = http.POST(payload);
+  Serial.printf("HTTP telemetry POST: %d\n", statusCode);
+  if (statusCode >= 400) {
+    String responseBody = http.getString();
+    Serial.printf("[HTTP ERROR BODY] %s\n", responseBody.c_str());
+  }
+  http.end();
+  return statusCode >= 200 && statusCode < 300;
+}
+
+void queueBatchMessage(const String &line) {
+  if (batchMutex == nullptr || line.isEmpty()) {
+    return;
+  }
+  if (xSemaphoreTake(batchMutex, 0) == pdTRUE) {
+    if (activeBatch->count < BATCH_MAX_MESSAGES) {
+      snprintf(activeBatch->messages[activeBatch->count], MAX_LINE_LENGTH, "%s", line.c_str());
+      activeBatch->count++;
+    }
+    xSemaphoreGive(batchMutex);
+  }
+}
+
+String makeGatewaySensorMessage(const String &raw) {
+  JsonDocument document;
+  document["module"] = "R";
+  document["id"] = DEVICE_ID;
+  document["raw"] = raw;
+  String payload;
+  serializeJson(document, payload);
+  return payload;
+}
+
+bool postBatch(BatchBuffer &batch) {
+  if (batch.count == 0) {
+    return true;
+  }
+  JsonDocument document;
+  document["type"] = "batch";
+  document["device_id"] = DEVICE_ID;
+  document["interval_ms"] = BATCH_INTERVAL_MS;
+  JsonArray messages = document["messages"].to<JsonArray>();
+  for (uint16_t i = 0; i < batch.count; ++i) {
+    messages.add(batch.messages[i]);
+  }
+  return postTelemetry(document);
+}
+
+void restoreBatch(BatchBuffer &batch) {
+  if (batch.count == 0 || batchMutex == nullptr) {
+    return;
+  }
+  if (xSemaphoreTake(batchMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    for (uint16_t i = 0; i < batch.count && activeBatch->count < BATCH_MAX_MESSAGES; ++i) {
+      snprintf(activeBatch->messages[activeBatch->count], MAX_LINE_LENGTH, "%s", batch.messages[i]);
+      activeBatch->count++;
+    }
+    xSemaphoreGive(batchMutex);
+  }
+}
+
+void batchWorker(void *) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(BATCH_INTERVAL_MS));
+    if (batchMutex == nullptr || xSemaphoreTake(batchMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+      continue;
+    }
+    BatchBuffer *ready = activeBatch;
+    activeBatch = sendingBatch;
+    sendingBatch = ready;
+    activeBatch->count = 0;
+    xSemaphoreGive(batchMutex);
+    const bool posted = postBatch(*sendingBatch);
+    Serial.printf("[BATCH] count=%u result=%s\n", sendingBatch->count, posted ? "OK" : "FAILED");
+    if (!posted) {
+      restoreBatch(*sendingBatch);
+    }
+    sendingBatch->count = 0;
+  }
+}
+
+void commandWorker(void *) {
+  for (;;) {
+    pollHttpCommands();
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
@@ -211,13 +313,48 @@ void pollHttpCommands() {
 
 void handleDeviceSerial() {
   while (DeviceSerial.available() > 0) {
-    const char ch = static_cast<char>(DeviceSerial.read());
+    const uint8_t byteValue = static_cast<uint8_t>(DeviceSerial.read());
+    const char ch = static_cast<char>(byteValue);
+    // Transparent bridge: every byte from GPIO15/RX is returned to the PC.
+    Serial.write(byteValue);
     if (ch == '\r') {
       continue;
     }
     if (ch == '\n') {
       if (!deviceLine.isEmpty()) {
-        sendSerialLine(deviceLine);
+        queueBatchMessage(deviceLine);
+        if (DEBUG_USB_MIRROR) {
+          Serial.printf("[GPIO15 RX] %s\n", deviceLine.c_str());
+        }
+        if (DEBUG_NODE_DIAGNOSTICS) {
+          Serial.printf("[DEBUG-GATEWAY] node frame: %s\n", deviceLine.c_str());
+        }
+        JsonDocument incoming;
+        const DeserializationError error = deserializeJson(incoming, deviceLine);
+        if (error || !incoming.is<JsonObject>()) {
+          if (DEBUG_NODE_DIAGNOSTICS) {
+            Serial.printf("[DEBUG-GATEWAY] JSON parse failed: %s\n", error.c_str());
+          }
+          sendStatus("error", "invalid local node JSON");
+        } else {
+          const char *nodeIdValue = incoming["node_id"] | "";
+          const char *moduleValue = incoming["module"] | "R";
+          const char *rawValue = incoming["raw"] | "";
+          const bool hasTemperature = !incoming["temperature"].isNull();
+          const bool hasHumidity = !incoming["humidity"].isNull();
+          const float temperature = incoming["temperature"] | 0.0f;
+          const float humidity = incoming["humidity"] | 0.0f;
+          if (nodeIdValue[0] == '\0' || !hasTemperature || !hasHumidity ||
+              humidity < 0.0f || humidity > 100.0f || temperature < -50.0f ||
+              temperature > 150.0f) {
+            if (DEBUG_NODE_DIAGNOSTICS) {
+              Serial.println("[DEBUG-GATEWAY] node reading validation failed");
+            }
+            sendStatus("error", "invalid local node reading");
+          } else {
+            // The complete JSON frame is already in the 5-second batch.
+          }
+        }
       }
       deviceLine = "";
       continue;
@@ -231,25 +368,41 @@ void handleDeviceSerial() {
   }
 }
 
+void handleUsbSerial() {
+  while (Serial.available() > 0) {
+    const uint8_t byteValue = static_cast<uint8_t>(Serial.read());
+    // Transparent bridge: every byte from the PC is sent to GPIO16/TX.
+    DeviceSerial.write(byteValue);
+  }
+}
+
 void handleSensorSerial() {
   while (SensorSerial.available() > 0) {
-    const char ch = static_cast<char>(SensorSerial.read());
+    const uint8_t byteValue = static_cast<uint8_t>(SensorSerial.read());
+    const char ch = static_cast<char>(byteValue);
     if (ch == '\r') {
       continue;
     }
     if (ch == '\n') {
       if (!sensorLine.isEmpty()) {
-        float humidity = 0.0f;
-        float temperature = 0.0f;
-        if (parseSensorLine(sensorLine, humidity, temperature)) {
-          Serial.printf("Sensor reading: RH %.1f%%, %.1fC\n", humidity, temperature);
-          sendSensorReading("R", humidity, temperature, sensorLine.c_str());
-        } else {
-          Serial.printf("Unrecognized sensor line: %s\n", sensorLine.c_str());
-          sendSerialLine(sensorLine);
+        // Always consume complete lines so the UART cannot back up. During
+        // the cooldown, discard them without parsing or network work.
+        if (static_cast<int32_t>(millis() - nextSensorRead) >= 0) {
+          float humidity = 0.0f;
+          float temperature = 0.0f;
+          if (parseSensorLine(sensorLine, humidity, temperature)) {
+            queueBatchMessage(makeGatewaySensorMessage(sensorLine));
+            nextSensorRead = millis() + SENSOR_SAMPLE_INTERVAL_MS;
+            Serial.printf("[GPIO4 RX] %s | RH %.1f%%, %.1fC\n", sensorLine.c_str(), humidity, temperature);
+          }
         }
       }
       sensorLine = "";
+      continue;
+    }
+    // Sensor frames are ASCII. Drop startup noise and malformed high-bit
+    // bytes so they cannot make the enclosing HTTPS JSON invalid UTF-8.
+    if (byteValue < 0x20 || byteValue > 0x7e) {
       continue;
     }
     if (sensorLine.length() < MAX_LINE_LENGTH) {
@@ -273,7 +426,7 @@ void emitDebugSensorReading() {
   const float humidity = 55.4f + phase * 0.2f;
   const float temperature = 26.5f + phase * 0.1f;
   SensorSerial.println("R:055.4RH 026.5C");
-  sendSensorReading("debug", humidity, temperature, "R:055.4RH 026.5C");
+  queueBatchMessage(makeGatewaySensorMessage("R:055.4RH 026.5C"));
   Serial.printf("Debug sensor reading: RH %.1f%%, %.1fC\n", humidity, temperature);
 }
 
@@ -324,20 +477,25 @@ void handleNetwork() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  DeviceSerial.begin(DEVICE_SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
+  DeviceSerial.begin(DEVICE_SERIAL_BAUD, SERIAL_8N1, NODE_RX_PIN, NODE_TX_PIN);
   SensorSerial.begin(SENSOR_SERIAL_BAUD, SERIAL_8N1, SENSOR_RX_PIN, SENSOR_TX_PIN);
-  Serial.println("ESP32-S3 WiFi serial bridge starting");
+  Serial.println("ESP32-S3 WiFi gateway starting");
+  Serial.printf("Local node UART: GPIO%d RX/GPIO%d TX @ %lu 8N1\n", NODE_RX_PIN, NODE_TX_PIN, DEVICE_SERIAL_BAUD);
   Serial.printf("Sensor UART: GPIO%d RX/GPIO%d TX @ %lu 8N1\n", SENSOR_RX_PIN, SENSOR_TX_PIN, SENSOR_SERIAL_BAUD);
+  batchMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(batchWorker, "batch", 12288, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(commandWorker, "commands", 6144, nullptr, 1, nullptr, 0);
   startWiFi();
 }
 
 void loop() {
+  // GPIO15/16 is the highest-priority path. Drain both UART directions first.
+  handleDeviceSerial();
+  handleUsbSerial();
   maintainWiFi();
   maintainTcp();
-  handleDeviceSerial();
   handleSensorSerial();
   emitDebugSensorReading();
   handleNetwork();
-  pollHttpCommands();
-  delay(2);
+  delay(0);
 }

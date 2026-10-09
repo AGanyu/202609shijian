@@ -17,12 +17,15 @@ function renderModules(modules) {
     return;
   }
   moduleGrid.innerHTML = modules.map((item) => `
-    <article class="module-card">
+    <article class="module-card${item.stale ? " is-stale" : ""}">
       <div class="module-title"><span class="module-name">${escapeHtml(item.module)}</span><span class="module-time">${escapeHtml(item.updatedAt || "--")}</span></div>
+      <div class="module-id">ID: ${escapeHtml(item.id || item.device_id || "--")}</div>
+      <div class="module-status"><span class="status-dot"></span>${item.stale ? "暂未收到新数据" : "实时"}</div>
       <div class="measurements">
         <div class="measure"><span class="measure-label">温度</span><span class="measure-value">${valueText(item.temperature, "℃")}</span></div>
         <div class="measure humidity"><span class="measure-label">湿度</span><span class="measure-value">${valueText(item.humidity, "%")}</span></div>
       </div>
+      <div class="module-raw">${escapeHtml(item.raw || "")}</div>
     </article>`).join("");
 }
 
@@ -39,7 +42,7 @@ async function refresh() {
     connectionStatus.classList.add("online");
     connectionStatus.innerHTML = '<span class="dot"></span>后端在线';
     document.querySelector("#deviceCount").textContent = (state.devices || state.clients || []).length;
-    document.querySelector("#moduleCount").textContent = state.modules.length;
+    document.querySelector("#moduleCount").textContent = (state.modules || []).length;
     document.querySelector("#lastUpdate").textContent = state.serverTime.slice(11, 19);
     renderModules(state.modules);
     renderLogs(state.messages);

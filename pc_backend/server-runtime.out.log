@@ -1,0 +1,4 @@
+Backend listening on ('0.0.0.0', 8765)
+Web dashboard listening on http://127.0.0.1:8080/
+Commands: send <text>, list, help, quit
+> 

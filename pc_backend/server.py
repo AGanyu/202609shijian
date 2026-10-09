@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 
 
 API_TOKEN = "u500703-esp32-telemetry-2026-change-me"
+MAX_HTTP_BODY = 262144
 
 
 def now_text() -> str:
@@ -46,12 +47,13 @@ def parse_sensor_line(line: object) -> dict | None:
         except json.JSONDecodeError:
             pairs = re.findall(r"([A-Za-z_][\w.-]*|模块|温度|湿度)\s*[=:：]\s*([^,，;；\s]+)", text)
             raw = {key.lower(): value for key, value in pairs}
-            if not raw:
+            if not raw or not any(key in raw for key in ("temperature", "humidity", "温度", "湿度")):
                 match = re.search(r"R\s*:\s*([0-9.]+)\s*RH\s+(-?[0-9.]+)\s*C", text, re.IGNORECASE)
                 if match:
-                    raw = {"module": "R", "humidity": match.group(1), "temperature": match.group(2)}
+                    raw = {**raw, "module": "R", "humidity": match.group(1), "temperature": match.group(2)}
                 else:
-                    return None
+                    if not raw:
+                        return None
 
     def pick(*keys: str) -> object:
         for key in keys:
@@ -65,15 +67,26 @@ def parse_sensor_line(line: object) -> dict | None:
 
     temperature = _number(pick("temperature", "temp", "温度"))
     humidity = _number(pick("humidity", "hum", "rh", "湿度"))
+    # Gateway self-readings use {module, id, raw}; parse the raw sensor frame
+    # while keeping the explicit module and id from the envelope.
+    raw_text = pick("raw", "raw_data", "rawData")
+    if (temperature is None or humidity is None) and isinstance(raw_text, str):
+        raw_sensor = parse_sensor_line(raw_text)
+        if raw_sensor is not None:
+            temperature = temperature if temperature is not None else raw_sensor["temperature"]
+            humidity = humidity if humidity is not None else raw_sensor["humidity"]
     if temperature is None and humidity is None:
         return None
-    module = str(pick("module", "module_id", "sensor", "name", "id", "模块") or "default")
+    module = str(pick("module", "module_id", "sensor", "name", "模块") or "default")
+    explicit_id = str(pick("id", "node_id") or "")
     device_id = str(pick("device_id", "device", "deviceId") or "")
     return {
         "device_id": device_id,
         "module": module,
+        "id": explicit_id or device_id,
         "temperature": temperature,
         "humidity": humidity,
+        "raw": str(raw_text) if raw_text not in (None, "") else str(line) if not isinstance(line, dict) else "",
         "updatedAt": now_text(),
     }
 
@@ -192,11 +205,19 @@ class Backend:
 
         active_devices = [item for item in self.devices.values() if recent(item)]
         active_device_ids = {item["device_id"] for item in active_devices}
+        # Keep the last known module readings visible after a short outage. The
+        # dashboard can then distinguish a stale reading from missing data.
+        known_modules = []
+        for item in self.sensor_modules.values():
+            module = dict(item)
+            module["active"] = item.get("device_id") in active_device_ids and recent(item)
+            module["stale"] = not module["active"]
+            known_modules.append(module)
         return {
             "serverTime": now_text(),
             "clients": [{"address": client.address} for client in self.clients.values()],
             "devices": active_devices,
-            "modules": [item for item in self.sensor_modules.values() if item.get("device_id") in active_device_ids and recent(item)],
+            "modules": known_modules,
             "messages": list(reversed(self.recent_messages)),
         }
 
@@ -217,8 +238,12 @@ class Backend:
                 headers[key.lower()] = value.strip()
             body = b""
             content_length = int(headers.get("content-length", "0") or "0")
+            if content_length > MAX_HTTP_BODY:
+                print(f"[{now_text()}] Rejected oversized HTTP body: {content_length} bytes")
+                await self.write_http(writer, 413, "application/json; charset=utf-8", b'{"ok":false,"error":"request body too large"}')
+                return
             if content_length:
-                body = await reader.readexactly(min(content_length, 16384))
+                body = await reader.readexactly(content_length)
 
             clean_path = path.split("?", 1)[0]
             if method == "GET" and clean_path == "/api/state":
@@ -228,14 +253,33 @@ class Backend:
                     await self.write_http(writer, 401, "application/json; charset=utf-8", b'{"ok":false,"error":"unauthorized"}')
                     return
                 try:
-                    payload = json.loads(body.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
+                    # Tolerate a BOM or NUL terminator added by a bridge.
+                    # Preserve a malformed sensor byte as U+FFFD instead of
+                    # rejecting the entire batch. The gateway still records
+                    # the original frame in its serial mirror.
+                    body_text = body.decode("utf-8-sig", errors="replace").replace("\x00", "").strip()
+                    payload = json.loads(body_text)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    detail = f" at position {error.pos}" if isinstance(error, json.JSONDecodeError) else ""
+                    print(f"[{now_text()}] Invalid telemetry JSON: {len(body)} bytes{detail}: head={body[:160]!r} tail={body[-160:]!r}")
                     await self.write_http(writer, 400, "application/json; charset=utf-8", b'{"ok":false,"error":"invalid JSON"}')
                 else:
                     peer = writer.get_extra_info("peername")
                     address = f"{peer[0]}:{peer[1]}" if peer else "http-client"
-                    message = payload if isinstance(payload, dict) and payload.get("type") else {"type": "serial", "data": payload}
-                    self.handle_message(address, message)
+                    if isinstance(payload, dict) and payload.get("type") == "batch":
+                        batch_device_id = str(payload.get("device_id") or "")
+                        messages = payload.get("messages", [])
+                        if isinstance(messages, list):
+                            for item in messages:
+                                message = {
+                                    "type": "serial",
+                                    "device_id": batch_device_id,
+                                    "data": item,
+                                }
+                                self.handle_message(address, message)
+                    else:
+                        message = payload if isinstance(payload, dict) and payload.get("type") else {"type": "serial", "data": payload}
+                        self.handle_message(address, message)
                     await self.write_http(writer, 200, "application/json; charset=utf-8", b'{"ok":true}')
             elif method == "GET" and clean_path == "/api/commands":
                 if headers.get("x-device-token") != API_TOKEN:
@@ -282,7 +326,7 @@ class Backend:
 
     @staticmethod
     async def write_http(writer: asyncio.StreamWriter, status: int, content_type: str, body: bytes) -> None:
-        reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 405: "Method Not Allowed"}.get(status, "Error")
+        reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 405: "Method Not Allowed", 413: "Payload Too Large"}.get(status, "Error")
         header = f"HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len(body)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".encode("ascii")
         writer.write(header + body)
         await writer.drain()

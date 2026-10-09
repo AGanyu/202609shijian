@@ -1,0 +1,8 @@
+Sketch uses 284877 bytes (21%) of program storage space. Maximum is 1310720 bytes.
+Global variables use 21760 bytes (6%) of dynamic memory, leaving 305920 bytes for local variables. Maximum is 327680 bytes.
+
+Used library Version Path
+ArduinoJson  7.4.3   D:\ArduinoTools\ArduinoSketchbook\libraries\ArduinoJson
+
+Used platform Version Path
+esp32:esp32   3.3.11  D:\ArduinoTools\arduino-data\packages\esp32\hardware\esp32\3.3.11
